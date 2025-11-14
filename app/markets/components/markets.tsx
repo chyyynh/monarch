@@ -1,45 +1,32 @@
 'use client';
 import { useCallback, useEffect, useState, useMemo } from 'react';
-import { useDisclosure, Tooltip } from '@heroui/react';
-import { ReloadIcon } from '@radix-ui/react-icons';
+import { useDisclosure } from '@heroui/react';
 import { Chain } from '@rainbow-me/rainbowkit';
-import { useRouter } from 'next/navigation';
-import { CgCompress } from "react-icons/cg";
-import { FiSettings } from 'react-icons/fi';
-import { RiExpandHorizontalLine } from 'react-icons/ri';
 
-import { Button } from '@/components/common';
-import { SuppliedAssetFilterCompactSwitch } from '@/components/common/SuppliedAssetFilterCompactSwitch';
 import Header from '@/components/layout/header/Header';
 import { useTokens } from '@/components/providers/TokenProvider';
 import TrustedVaultsModal from '@/components/settings/TrustedVaultsModal';
 import EmptyScreen from '@/components/Status/EmptyScreen';
 import LoadingScreen from '@/components/Status/LoadingScreen';
 import { SupplyModalV2 } from '@/components/SupplyModalV2';
-import { TooltipContent } from '@/components/TooltipContent';
-import { DEFAULT_MIN_SUPPLY_USD, DEFAULT_MIN_LIQUIDITY_USD } from '@/constants/markets';
-import { defaultTrustedVaults, getVaultKey, type TrustedVault } from '@/constants/vaults/known_vaults';
+import { defaultTrustedVaults, type TrustedVault } from '@/constants/vaults/known_vaults';
+import { useFilteredMarkets } from '@/hooks/useFilteredMarkets';
 import { useLocalStorage } from '@/hooks/useLocalStorage';
 import { useMarkets } from '@/hooks/useMarkets';
 import { usePagination } from '@/hooks/usePagination';
 import { useStaredMarkets } from '@/hooks/useStaredMarkets';
 import { useStyledToast } from '@/hooks/useStyledToast';
-import { filterMarkets, sortMarkets, createPropertySort, createStarredSort } from '@/utils/marketFilters';
-import { parseNumericThreshold } from '@/utils/markets';
+import { useMarketStore } from '@/store/useMarketStore';
 import { SupportedNetworks } from '@/utils/networks';
-import { PriceFeedVendors } from '@/utils/oracle';
-import * as keys from '@/utils/storageKeys';
 import { ERC20Token, UnknownERC20Token } from '@/utils/tokens';
 import { Market } from '@/utils/types';
 
 import AdvancedSearchBar, { ShortcutType } from './AdvancedSearchBar';
-import AssetFilter from './AssetFilter';
-import { DEFAULT_COLUMN_VISIBILITY, ColumnVisibility } from './columnVisibility';
 import { SortColumn } from './constants';
+import { MarketFilters } from './MarketFilters';
 import MarketSettingsModal from './MarketSettingsModal';
+import { MarketToolbar } from './MarketToolbar';
 import MarketsTable from './marketsTable';
-import NetworkFilter from './NetworkFilter';
-import OracleFilter from './OracleFilter';
 
 type MarketContentProps = {
   initialNetwork: SupportedNetworks | null;
@@ -52,10 +39,13 @@ export default function Markets({
   initialCollaterals,
   initialLoanAssets,
 }: MarketContentProps) {
-  const router = useRouter();
-
   const toast = useStyledToast();
 
+  // Zustand store
+  const { filters, settings, sort, setFilter, setSort, setUsdFilter, setColumnVisibility } =
+    useMarketStore();
+
+  // API hooks
   const {
     loading,
     markets: rawMarkets,
@@ -63,14 +53,18 @@ export default function Markets({
     isRefetching,
     showUnwhitelistedMarkets,
     setShowUnwhitelistedMarkets,
-    addBlacklistedMarket: addBlacklistedMarketBase,
+    addBlacklistedMarket,
     isBlacklisted,
   } = useMarkets();
   const { staredIds, starMarket, unstarMarket } = useStaredMarkets();
+  const { allTokens } = useTokens();
 
-  // Use addBlacklistedMarket directly from context
-  // The context automatically reapplies the filter when blacklist changes
-  const addBlacklistedMarket = addBlacklistedMarketBase;
+  // Local state (not in store)
+  const [showSupplyModal, setShowSupplyModal] = useState(false);
+  const [selectedMarket, setSelectedMarket] = useState<Market | undefined>(undefined);
+  const [uniqueCollaterals, setUniqueCollaterals] = useState<(ERC20Token | UnknownERC20Token)[]>([]);
+  const [uniqueLoanAssets, setUniqueLoanAssets] = useState<(ERC20Token | UnknownERC20Token)[]>([]);
+  const [isTrustedVaultsModalOpen, setIsTrustedVaultsModalOpen] = useState(false);
 
   const {
     isOpen: isSettingsModalOpen,
@@ -78,148 +72,49 @@ export default function Markets({
     onOpenChange: onSettingsModalOpenChange,
   } = useDisclosure();
 
-  // Initialize state with server-parsed values
-  const [selectedCollaterals, setSelectedCollaterals] = useState<string[]>(initialCollaterals);
-  const [selectedLoanAssets, setSelectedLoanAssets] = useState<string[]>(initialLoanAssets);
-  const [selectedNetwork, setSelectedNetwork] = useState<SupportedNetworks | null>(initialNetwork);
-
-  const [uniqueCollaterals, setUniqueCollaterals] = useState<(ERC20Token | UnknownERC20Token)[]>(
-    [],
-  );
-  const [uniqueLoanAssets, setUniqueLoanAssets] = useState<(ERC20Token | UnknownERC20Token)[]>([]);
-
-  const [sortColumn, setSortColumn] = useLocalStorage(keys.MarketSortColumnKey, SortColumn.Supply);
-  const [sortDirection, setSortDirection] = useLocalStorage(keys.MarketSortDirectionKey, -1);
-
-  const [showSupplyModal, setShowSupplyModal] = useState(false);
-  const [selectedMarket, setSelectedMarket] = useState<Market | undefined>(undefined);
-
-  const [filteredMarkets, setFilteredMarkets] = useState<Market[]>([]);
-
-  const [searchQuery, setSearchQuery] = useState<string>('');
-
-  const [selectedOracles, setSelectedOracles] = useState<PriceFeedVendors[]>([]);
-
   const { currentPage, setCurrentPage, entriesPerPage, handleEntriesPerPageChange, resetPage } =
     usePagination();
 
-  const [includeUnknownTokens, setIncludeUnknownTokens] = useLocalStorage(
-    keys.MarketsShowUnknownTokens,
-    false,
-  );
-  const [showUnknownOracle, setShowUnknownOracle] = useLocalStorage(keys.MarketsShowUnknownOracle, false);
-
-  const { allTokens, findToken } = useTokens();
-
-  // USD Filter values
-  const [usdMinSupply, setUsdMinSupply] = useLocalStorage(
-    keys.MarketsUsdMinSupplyKey,
-    DEFAULT_MIN_SUPPLY_USD.toString(),
-  );
-  const [usdMinBorrow, setUsdMinBorrow] = useLocalStorage(keys.MarketsUsdMinBorrowKey, '');
-  const [usdMinLiquidity, setUsdMinLiquidity] = useLocalStorage(
-    keys.MarketsUsdMinLiquidityKey,
-    DEFAULT_MIN_LIQUIDITY_USD.toString(),
-  );
-
-  // USD Filter enabled states
-  const [minSupplyEnabled, setMinSupplyEnabled] = useLocalStorage(
-    keys.MarketsMinSupplyEnabledKey,
-    true, // Default to enabled for backward compatibility
-  );
-  const [minBorrowEnabled, setMinBorrowEnabled] = useLocalStorage(
-    keys.MarketsMinBorrowEnabledKey,
-    false,
-  );
-  const [minLiquidityEnabled, setMinLiquidityEnabled] = useLocalStorage(
-    keys.MarketsMinLiquidityEnabledKey,
-    false,
-  );
-
-  const [trustedVaultsOnly, setTrustedVaultsOnly] = useLocalStorage(
-    keys.MarketsTrustedVaultsOnlyKey,
-    false,
-  );
-
-  // Column visibility state
-  const [columnVisibilityState, setColumnVisibilityState] = useLocalStorage<ColumnVisibility>(
-    keys.MarketsColumnVisibilityKey,
-    DEFAULT_COLUMN_VISIBILITY,
-  );
-
-  const columnVisibility = useMemo(
-    () => ({ ...DEFAULT_COLUMN_VISIBILITY, ...columnVisibilityState }),
-    [columnVisibilityState],
-  );
-
-  const setColumnVisibility = useCallback(
-    (visibility: ColumnVisibility) => {
-      setColumnVisibilityState({ ...DEFAULT_COLUMN_VISIBILITY, ...visibility });
-    },
-    [setColumnVisibilityState],
-  );
-
-  // Table view mode: 'compact' (scrollable) or 'expanded' (full width)
-  const [tableViewMode, setTableViewMode] = useLocalStorage<'compact' | 'expanded'>(
-    keys.MarketsTableViewModeKey,
-    'compact',
-  );
-
+  // User-managed trusted vaults
   const [userTrustedVaults, setUserTrustedVaults] = useLocalStorage<TrustedVault[]>(
     'userTrustedVaults',
     defaultTrustedVaults,
   );
-  const [isTrustedVaultsModalOpen, setIsTrustedVaultsModalOpen] = useState(false);
 
-  const trustedVaultKeys = useMemo(() => {
-    return new Set(
-      userTrustedVaults.map((vault) => getVaultKey(vault.address, vault.chainId)),
-    );
-  }, [userTrustedVaults]);
+  // Initialize filters from URL params on mount
+  useEffect(() => {
+    if (initialNetwork !== null) setFilter('selectedNetwork', initialNetwork);
+    if (initialCollaterals.length > 0) setFilter('selectedCollaterals', initialCollaterals);
+    if (initialLoanAssets.length > 0) setFilter('selectedLoanAssets', initialLoanAssets);
+  }, []); // Only run once on mount
 
-  const hasTrustedVault = useCallback(
-    (market: Market) => {
-      if (!market.supplyingVaults?.length) return false;
-      const chainId = market.morphoBlue.chain.id;
-      return market.supplyingVaults.some((vault) => {
-        if (!vault.address) return false;
-        return trustedVaultKeys.has(getVaultKey(vault.address as string, chainId));
-      });
-    },
-    [trustedVaultKeys],
-  );
-
-  // Create memoized usdFilters object from individual localStorage values to prevent re-renders
+  // USD filters helpers
   const usdFilters = useMemo(
     () => ({
-      minSupply: usdMinSupply,
-      minBorrow: usdMinBorrow,
-      minLiquidity: usdMinLiquidity,
+      minSupply: settings.usdFilters.minSupply,
+      minBorrow: settings.usdFilters.minBorrow,
+      minLiquidity: settings.usdFilters.minLiquidity,
     }),
-    [usdMinSupply, usdMinBorrow, usdMinLiquidity],
+    [settings.usdFilters],
   );
 
   const setUsdFilters = useCallback(
     (filters: { minSupply: string; minBorrow: string; minLiquidity: string }) => {
-      setUsdMinSupply(filters.minSupply);
-      setUsdMinBorrow(filters.minBorrow);
-      setUsdMinLiquidity(filters.minLiquidity);
+      setUsdFilter('minSupply', filters.minSupply);
+      setUsdFilter('minBorrow', filters.minBorrow);
+      setUsdFilter('minLiquidity', filters.minLiquidity);
     },
-    [setUsdMinSupply, setUsdMinBorrow, setUsdMinLiquidity],
+    [setUsdFilter],
   );
 
-  const effectiveMinSupply = parseNumericThreshold(usdFilters.minSupply);
-  const effectiveMinBorrow = parseNumericThreshold(usdFilters.minBorrow);
-  const effectiveMinLiquidity = parseNumericThreshold(usdFilters.minLiquidity);
-
+  // Process unique tokens from markets
   useEffect(() => {
-    // return if no markets
     if (!rawMarkets) return;
 
     const processTokens = (
       tokenInfoList: { address: string; chainId: number; symbol: string; decimals: number }[],
     ) => {
-      if (!includeUnknownTokens) return allTokens;
+      if (!settings.includeUnknownTokens) return allTokens;
 
       // Process unknown tokens
       const unknownTokensBySymbol = tokenInfoList.reduce(
@@ -272,111 +167,22 @@ export default function Markets({
 
     setUniqueCollaterals(processTokens(collatList));
     setUniqueLoanAssets(processTokens(loanList));
-  }, [rawMarkets, includeUnknownTokens, allTokens]);
+  }, [rawMarkets, settings.includeUnknownTokens, allTokens]);
 
-  const updateUrlParams = useCallback(
-    (collaterals: string[], loanAssets: string[], network: SupportedNetworks | null) => {
-      const params = new URLSearchParams();
-
-      if (collaterals.length > 0) {
-        params.set('collaterals', collaterals.join(','));
-      }
-      if (loanAssets.length > 0) {
-        params.set('loanAssets', loanAssets.join(','));
-      }
-      if (network) {
-        params.set('network', network.toString());
-      }
-
-      const newParams = params.toString();
-      router.push(`?${newParams}`, { scroll: false });
-    },
-    [router],
-  );
-
-  const applyFiltersAndSort = useCallback(() => {
-    if (!rawMarkets) return;
-
-    // Apply filters using the new composable filtering system
-    let filtered = filterMarkets(rawMarkets, {
-      selectedNetwork,
-      showUnknownTokens: includeUnknownTokens,
-      showUnknownOracle,
-      selectedCollaterals,
-      selectedLoanAssets,
-      selectedOracles,
-      usdFilters: {
-        minSupply: { enabled: minSupplyEnabled, threshold: usdFilters.minSupply },
-        minBorrow: { enabled: minBorrowEnabled, threshold: usdFilters.minBorrow },
-        minLiquidity: { enabled: minLiquidityEnabled, threshold: usdFilters.minLiquidity },
-      },
-      findToken,
-      searchQuery,
-    });
-
-    if (trustedVaultsOnly) {
-      filtered = filtered.filter(hasTrustedVault);
-    }
-
-    // Apply sorting
-    let sorted: Market[];
-    if (sortColumn === SortColumn.Starred) {
-      sorted = sortMarkets(filtered, createStarredSort(staredIds), 1);
-    } else if (sortColumn === SortColumn.TrustedBy) {
-      sorted = sortMarkets(
-        filtered,
-        (a, b) => Number(hasTrustedVault(a)) - Number(hasTrustedVault(b)),
-        sortDirection as 1 | -1,
-      );
-    } else {
-      const sortPropertyMap: Record<SortColumn, string> = {
-        [SortColumn.Starred]: 'uniqueKey',
-        [SortColumn.LoanAsset]: 'loanAsset.name',
-        [SortColumn.CollateralAsset]: 'collateralAsset.name',
-        [SortColumn.LLTV]: 'lltv',
-        [SortColumn.Supply]: 'state.supplyAssetsUsd',
-        [SortColumn.Borrow]: 'state.borrowAssetsUsd',
-        [SortColumn.SupplyAPY]: 'state.supplyApy',
-        [SortColumn.Liquidity]: 'state.liquidityAssets',
-        [SortColumn.BorrowAPY]: 'state.borrowApy',
-        [SortColumn.RateAtTarget]: 'state.apyAtTarget',
-        [SortColumn.TrustedBy]: '',
-      };
-      const propertyPath = sortPropertyMap[sortColumn];
-      if (propertyPath) {
-        sorted = sortMarkets(filtered, createPropertySort(propertyPath), sortDirection as 1 | -1);
-      } else {
-        sorted = filtered;
-      }
-    }
-
-    setFilteredMarkets(sorted);
-    resetPage();
-  }, [
-    rawMarkets,
-    sortColumn,
-    sortDirection,
-    selectedNetwork,
-    includeUnknownTokens,
-    showUnknownOracle,
-    selectedCollaterals,
-    selectedLoanAssets,
-    selectedOracles,
+  // Use custom hook for filtering and sorting
+  const filteredMarkets = useFilteredMarkets({
+    markets: rawMarkets,
+    filters,
+    settings,
+    sort,
     staredIds,
-    findToken,
-    usdFilters,
-    minSupplyEnabled,
-    minBorrowEnabled,
-    minLiquidityEnabled,
-    trustedVaultsOnly,
-    searchQuery,
-    resetPage,
-    hasTrustedVault,
-  ]);
+    trustedVaults: userTrustedVaults,
+  });
 
+  // Reset pagination when filters change
   useEffect(() => {
-    applyFiltersAndSort();
-  }, [applyFiltersAndSort]);
+    resetPage();
+  }, [filteredMarkets.length, resetPage]);
 
   const titleOnclick = useCallback(
     (column: number) => {
@@ -387,13 +193,9 @@ export default function Markets({
         return;
       }
 
-      setSortColumn(column);
-
-      if (column === sortColumn) {
-        setSortDirection(-sortDirection);
-      }
+      setSort(column);
     },
-    [sortColumn, sortDirection, setSortColumn, setSortDirection],
+    [setSort],
   );
 
   // Add keyboard shortcut for search
@@ -414,40 +216,47 @@ export default function Markets({
     };
   }, []);
 
-  const handleSearch = (query: string) => {
-    setSearchQuery(query);
-    // We don't need to call applyFiltersAndSort here, as it will be triggered by the useEffect
-  };
+  const handleSearch = useCallback(
+    (query: string) => {
+      setFilter('searchQuery', query);
+    },
+    [setFilter],
+  );
 
-  const handleFilterUpdate = (type: ShortcutType, tokens: string[]) => {
-    // remove duplicates
-    const uniqueTokens = [...new Set(tokens)];
+  const handleFilterUpdate = useCallback(
+    (type: ShortcutType, tokens: string[]) => {
+      // remove duplicates
+      const uniqueTokens = [...new Set(tokens)];
 
-    if (type === ShortcutType.Collateral) {
-      setSelectedCollaterals(uniqueTokens);
-    } else {
-      setSelectedLoanAssets(uniqueTokens);
-    }
-    // We don't need to call applyFiltersAndSort here, as it will be triggered by the useEffect
-  };
+      if (type === ShortcutType.Collateral) {
+        setFilter('selectedCollaterals', uniqueTokens);
+      } else {
+        setFilter('selectedLoanAssets', uniqueTokens);
+      }
+    },
+    [setFilter],
+  );
 
-  const handleMarketClick = (market: Market) => {
-    // Build URL with current state instead of searchParams
-    const params = new URLSearchParams();
-    if (selectedCollaterals.length > 0) {
-      params.set('collaterals', selectedCollaterals.join(','));
-    }
-    if (selectedLoanAssets.length > 0) {
-      params.set('loanAssets', selectedLoanAssets.join(','));
-    }
-    if (selectedNetwork) {
-      params.set('network', selectedNetwork.toString());
-    }
+  const handleMarketClick = useCallback(
+    (market: Market) => {
+      // Build URL with current state from store
+      const params = new URLSearchParams();
+      if (filters.selectedCollaterals.length > 0) {
+        params.set('collaterals', filters.selectedCollaterals.join(','));
+      }
+      if (filters.selectedLoanAssets.length > 0) {
+        params.set('loanAssets', filters.selectedLoanAssets.join(','));
+      }
+      if (filters.selectedNetwork) {
+        params.set('network', filters.selectedNetwork.toString());
+      }
 
-    const marketPath = `/market/${market.morphoBlue.chain.id}/${market.uniqueKey}`;
-    const targetPath = params.toString() ? `${marketPath}?${params.toString()}` : marketPath;
-    window.open(targetPath, '_blank');
-  };
+      const marketPath = `/market/${market.morphoBlue.chain.id}/${market.uniqueKey}`;
+      const targetPath = params.toString() ? `${marketPath}?${params.toString()}` : marketPath;
+      window.open(targetPath, '_blank');
+    },
+    [filters],
+  );
 
   const handleRefresh = () => {
     refetch(() => toast.success('Markets refreshed', 'Markets refreshed successfully'));
@@ -472,7 +281,7 @@ export default function Markets({
           setUsdFilters={setUsdFilters}
           entriesPerPage={entriesPerPage}
           onEntriesPerPageChange={handleEntriesPerPageChange}
-          columnVisibility={columnVisibility}
+          columnVisibility={settings.columnVisibility}
           setColumnVisibility={setColumnVisibility}
           onOpenTrustedVaultsModal={() => setIsTrustedVaultsModalOpen(true)}
           trustedVaults={userTrustedVaults}
@@ -480,166 +289,43 @@ export default function Markets({
 
         <div className="flex items-center justify-between pb-4">
           <AdvancedSearchBar
-            searchQuery={searchQuery}
+            searchQuery={filters.searchQuery}
             onSearch={handleSearch}
             onFilterUpdate={handleFilterUpdate}
-            selectedCollaterals={selectedCollaterals}
-            selectedLoanAssets={selectedLoanAssets}
+            selectedCollaterals={filters.selectedCollaterals}
+            selectedLoanAssets={filters.selectedLoanAssets}
             uniqueCollaterals={uniqueCollaterals}
             uniqueLoanAssets={uniqueLoanAssets}
           />
         </div>
 
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex flex-col gap-4 lg:flex-row">
-            <div className="flex flex-col gap-4 lg:flex-row">
-              <NetworkFilter
-                selectedNetwork={selectedNetwork}
-                setSelectedNetwork={(network) => {
-                  setSelectedNetwork(network);
-                  updateUrlParams(selectedCollaterals, selectedLoanAssets, network);
-                }}
-              />
-
-              <AssetFilter
-                label="Loan Asset"
-                placeholder="All loan asset"
-                selectedAssets={selectedLoanAssets}
-                setSelectedAssets={(assets) => {
-                  setSelectedLoanAssets(assets);
-                  updateUrlParams(selectedCollaterals, assets, selectedNetwork);
-                }}
-                items={uniqueLoanAssets}
-                loading={loading}
-                updateFromSearch={searchQuery.match(/loan:(\w+)/)?.[1]?.split(',')}
-              />
-
-              <AssetFilter
-                label="Collateral"
-                placeholder="All collateral"
-                selectedAssets={selectedCollaterals}
-                setSelectedAssets={(assets) => {
-                  setSelectedCollaterals(assets);
-                  updateUrlParams(assets, selectedLoanAssets, selectedNetwork);
-                }}
-                items={uniqueCollaterals}
-                loading={loading}
-                updateFromSearch={searchQuery.match(/collateral:(\w+)/)?.[1]?.split(',')}
-              />
-
-              <OracleFilter
-                selectedOracles={selectedOracles}
-                setSelectedOracles={setSelectedOracles}
-              />
-            </div>
-          </div>
+          <MarketFilters
+            uniqueCollaterals={uniqueCollaterals}
+            uniqueLoanAssets={uniqueLoanAssets}
+            loading={loading}
+            searchQuery={filters.searchQuery}
+          />
 
           {/* Settings */}
           <div className="mt-4 flex items-center gap-2 lg:mt-0">
-            <SuppliedAssetFilterCompactSwitch
-              includeUnknownTokens={includeUnknownTokens}
-              setIncludeUnknownTokens={setIncludeUnknownTokens}
-              showUnknownOracle={showUnknownOracle}
-              setShowUnknownOracle={setShowUnknownOracle}
+            <MarketToolbar
+              loading={loading}
+              isRefetching={isRefetching}
+              onRefresh={handleRefresh}
+              onOpenSettings={onSettingsModalOpen}
               showUnwhitelistedMarkets={showUnwhitelistedMarkets}
               setShowUnwhitelistedMarkets={setShowUnwhitelistedMarkets}
-              trustedVaultsOnly={trustedVaultsOnly}
-              setTrustedVaultsOnly={setTrustedVaultsOnly}
-              minSupplyEnabled={minSupplyEnabled}
-              setMinSupplyEnabled={setMinSupplyEnabled}
-              minBorrowEnabled={minBorrowEnabled}
-              setMinBorrowEnabled={setMinBorrowEnabled}
-              minLiquidityEnabled={minLiquidityEnabled}
-              setMinLiquidityEnabled={setMinLiquidityEnabled}
-              thresholds={{
-                minSupply: effectiveMinSupply,
-                minBorrow: effectiveMinBorrow,
-                minLiquidity: effectiveMinLiquidity,
-              }}
-              onOpenSettings={onSettingsModalOpen}
             />
-
-            <Tooltip
-              classNames={{
-                base: 'p-0 m-0 bg-transparent shadow-sm border-none',
-                content: 'p-0 m-0 bg-transparent shadow-sm border-none',
-              }}
-              content={<TooltipContent title="Refresh" detail="Fetch the latest market data" />}
-            >
-              <Button
-                disabled={loading || isRefetching}
-                variant="light"
-                size="sm"
-                className="text-secondary min-w-0 px-2"
-                onPress={handleRefresh}
-                isIconOnly
-              >
-                <ReloadIcon className={`${isRefetching ? 'animate-spin' : ''} h-3 w-3`} />
-              </Button>
-            </Tooltip>
-
-            <Tooltip
-              classNames={{
-                base: 'p-0 m-0 bg-transparent shadow-sm border-none',
-                content: 'p-0 m-0 bg-transparent shadow-sm border-none',
-              }}
-              content={
-                <TooltipContent
-                  icon={
-                    tableViewMode === 'compact' ? (
-                      <RiExpandHorizontalLine size={14} />
-                    ) : (
-                      <CgCompress size={14} />
-                    )
-                  }
-                  title={tableViewMode === 'compact' ? 'Expand Table' : 'Compact Table'}
-                  detail={tableViewMode === 'compact' ? 'Expand table to full width, useful when more columns are enabled.' : 'Restore compact table view'}
-                />
-              }
-            >
-              <Button
-                isIconOnly
-                aria-label="Toggle table width"
-                variant="light"
-                size="sm"
-                className="text-secondary min-w-0 px-2"
-                onPress={() => setTableViewMode(tableViewMode === 'compact' ? 'expanded' : 'compact')}
-              >
-                {tableViewMode === 'compact' ? (
-                  <RiExpandHorizontalLine size={16} />
-                ) : (
-                  <CgCompress size={16} />
-                )}
-              </Button>
-            </Tooltip>
-
-            <Tooltip
-              classNames={{
-                base: 'p-0 m-0 bg-transparent shadow-sm border-none',
-                content: 'p-0 m-0 bg-transparent shadow-sm border-none',
-              }}
-              content={<TooltipContent title="Preferences" detail="Adjust thresholds and columns" />}
-            >
-              <Button
-                isIconOnly
-                aria-label="Market Preferences"
-                variant="light"
-                size="sm"
-                className="text-secondary min-w-0 px-2"
-                onPress={onSettingsModalOpen}
-              >
-                <FiSettings size={12} />
-              </Button>
-            </Tooltip>
           </div>
         </div>
       </div>
 
       {/* Table Section - can expand beyond container in expanded mode */}
-      <div className={tableViewMode === 'expanded' ? 'mt-4 px-[2%]' : 'container px-[4%] mt-4'}>
+      <div className={settings.tableViewMode === 'expanded' ? 'mt-4 px-[2%]' : 'container px-[4%] mt-4'}>
 
         {loading ? (
-          <div className={tableViewMode === 'expanded' ? 'container px-[4%]' : 'w-full'}>
+          <div className={settings.tableViewMode === 'expanded' ? 'container px-[4%]' : 'w-full'}>
             <LoadingScreen
               message="Loading Morpho Blue Markets..."
               className="min-h-[300px] w-full"
@@ -648,13 +334,13 @@ export default function Markets({
         ) : rawMarkets == null ? (
           <div className="flex justify-center"> No data </div>
         ) : (
-          <div className={tableViewMode === 'expanded' ? 'flex justify-center' : 'w-full'}>
+          <div className={settings.tableViewMode === 'expanded' ? 'flex justify-center' : 'w-full'}>
             {filteredMarkets.length > 0 ? (
               <MarketsTable
                 markets={filteredMarkets}
                 titleOnclick={titleOnclick}
-                sortColumn={sortColumn}
-                sortDirection={sortDirection}
+                sortColumn={sort.column}
+                sortDirection={sort.direction}
                 onMarketClick={handleMarketClick}
                 staredIds={staredIds}
                 starMarket={starMarket}
@@ -664,11 +350,11 @@ export default function Markets({
                 setCurrentPage={setCurrentPage}
                 setShowSupplyModal={setShowSupplyModal}
                 setSelectedMarket={setSelectedMarket}
-                columnVisibility={columnVisibility}
+                columnVisibility={settings.columnVisibility}
                 trustedVaults={userTrustedVaults}
-                className={tableViewMode === 'compact' ? 'w-full' : undefined}
-                wrapperClassName={tableViewMode === 'compact' ? 'w-full' : undefined}
-                tableClassName={tableViewMode === 'compact' ? 'w-full min-w-full' : undefined}
+                className={settings.tableViewMode === 'compact' ? 'w-full' : undefined}
+                wrapperClassName={settings.tableViewMode === 'compact' ? 'w-full' : undefined}
+                tableClassName={settings.tableViewMode === 'compact' ? 'w-full min-w-full' : undefined}
                 addBlacklistedMarket={addBlacklistedMarket}
                 isBlacklisted={isBlacklisted}
               />
@@ -676,14 +362,14 @@ export default function Markets({
               <EmptyScreen
                 message="No markets found with the current filters"
                 hint={
-                  (selectedCollaterals.length > 0 || selectedLoanAssets.length > 0) &&
-                  !includeUnknownTokens
+                  (filters.selectedCollaterals.length > 0 || filters.selectedLoanAssets.length > 0) &&
+                  !settings.includeUnknownTokens
                     ? "Try enabling 'Show Unknown Tokens' in settings, or adjust your current filters."
-                    : selectedOracles.length > 0 && !showUnknownOracle
+                    : filters.selectedOracles.length > 0 && !settings.showUnknownOracle
                     ? "Try enabling 'Show Unknown Oracles' in settings, or adjust your oracle filters."
-                    : trustedVaultsOnly
+                    : settings.trustedVaultsOnly
                     ? 'Disable the Trusted Vaults filter or update your trusted list in Settings.'
-                    : minSupplyEnabled || minBorrowEnabled || minLiquidityEnabled
+                    : settings.filterEnabled.minSupply || settings.filterEnabled.minBorrow || settings.filterEnabled.minLiquidity
                     ? 'Try disabling USD filters in settings, or adjust your filter thresholds.'
                     : 'Try adjusting your filters or search query to see more results.'
                 }
